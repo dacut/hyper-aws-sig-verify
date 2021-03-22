@@ -14,12 +14,11 @@ use futures::{
 use http::request::Parts;
 use hyper::{
     body::{Body, Bytes},
-    service::{Service, HttpService},
+    service::{Service},
     Error as HyperError, Request, Response, StatusCode,
 };
 use log::error;
 use serde_json::json;
-use tokio::runtime::Handle;
 
 /// AWSSigV4VerifierService implements a Hyper service that authenticates a request against AWS SigV4 signing protocol.
 #[derive(Clone)]
@@ -74,16 +73,14 @@ impl<S> Display for AwsSigV4VerifierService<S> {
     }
 }
 
-impl<S> HttpService<Body> for AwsSigV4VerifierService<S>
+impl<S> Service<Request<Body>> for AwsSigV4VerifierService<S>
 where
-    S: HttpService<
-        Body,
-        ResBody=Body,
+    S: Service<Request<Body>, Response=Response<Body>,
         Error=Box<dyn Error + Send + Sync + 'static>,
         Future=Pin<Box<dyn Future<Output=Result<Response<Body>, Box<dyn Error + Send + Sync + 'static>>> + Send + Sync + 'static>>>
     + Clone + Send + Sync + 'static,
 {
-    type ResBody = Body;
+    type Response = Response<Body>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output=Result<Response<Body>, S::Error>> + Send + Sync + 'static>>;
 
