@@ -6,10 +6,9 @@ use futures::stream::StreamExt;
 use http::request::Parts;
 use hyper::{
     body::{Body, Bytes},
-    Error as HyperError, Request, Response, StatusCode,
+    Error as HyperError, Request, Response,
 };
-use log::{debug, error, warn};
-use serde_json::json;
+use log::{debug, warn};
 use std::{
     any::type_name,
     fmt::{Debug, Display, Formatter, Result as FmtResult},
@@ -176,55 +175,50 @@ where
     S::Future: Send,
     S::Error: Into<BoxError> + Send + Sync,
 {
+    debug!("Request: {} {}", parts.method, parts.uri);
+    debug!("Request headers:");
+    for (key, value) in &parts.headers {
+        let value_disp = match value.to_str() {
+            Ok(v) => v,
+            Err(_) => "<INVALID>",
+        };
+
+        debug!("{}: {}", key, value_disp);
+    }
+
     // We need the actual body in order to compute the signature.
     match body_to_bytes(body).await {
         Err(e) => Err(e.into()),
         Ok(body) => {
             let aws_req = AwsSigVerifyRequest::from_http_request_parts(&parts, Some(body.clone()));
             let sig_req = match aws_req.to_get_signing_key_request(signing_key_kind, &region, &service) {
-                Ok(sig_req) => sig_req,
+                Ok(sig_req) => Some(sig_req),
                 Err(e) => {
-                    error!("Failed to generate a GetSigningKeyRequest request from Request: {:?}", e);
-                    return Err(e.into());
+                    warn!("Failed to generate a GetSigningKeyRequest request from Request: {:?}", e);
+                    None
                 }
             };
-            let (principal, signing_key) = match get_signing_key.oneshot(sig_req).await {
-                Ok((principal, signing_key)) => {
-                    debug!("Get signing key returned principal {:?}", principal);
-                    (principal, signing_key)
-                }
-                Err(e) => {
-                    warn!("Get signing key failed: {:?}", e);
-                    return Err(e.into());
-                }
-            };
-            match sigv4_verify(&aws_req, &signing_key, allowed_mismatch, &region, &service) {
-                Ok(()) => {
-                    let new_body = Bytes::copy_from_slice(&body);
-                    parts.extensions.insert(principal);
-                    let new_req = Request::from_parts(parts, Body::from(new_body));
-                    match implementation.oneshot(new_req).await {
-                        Ok(r) => Ok(r),
-                        Err(e) => Err(e.into()),
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to verify signature: {:?}", e);
-                    let resp_body = Body::from(
-                        json!({
-                            "Error": {
-                                "Code": "NotAuthorized",
-                                "Message": "SigV4 validation failed",
+            if let Some(sig_req) = sig_req {
+                match get_signing_key.oneshot(sig_req).await {
+                    Ok((principal, signing_key)) => {
+                        debug!("Get signing key returned principal {:?}", principal);
+                        match sigv4_verify(&aws_req, &signing_key, allowed_mismatch, &region, &service) {
+                            Ok(()) => {
+                                debug!("Signature verified; adding principal to request: {:?}", principal);
+                                parts.extensions.insert(principal);
                             }
-                        })
-                        .to_string(),
-                    );
-                    let response = Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .header("Content-Type", "application/json")
-                        .body(resp_body);
-                    Ok(response.unwrap())
+                            Err(e) => warn!("Signature mismatch: {:?}", e),
+                        }
+                    }
+                    Err(e) => warn!("Get signing key failed: {:?}", e),
                 }
+            }
+            
+            let new_body = Bytes::copy_from_slice(&body);
+            let new_req = Request::from_parts(parts, Body::from(new_body));
+            match implementation.oneshot(new_req).await {
+                Ok(r) => Ok(r),
+                Err(e) => Err(e.into()),
             }
         }
     }

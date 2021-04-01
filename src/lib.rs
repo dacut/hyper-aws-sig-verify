@@ -16,6 +16,7 @@ mod tests {
         service::{make_service_fn, service_fn},
         Body, Request, Response, Server,
     };
+    use log::debug;
     use rusoto_core::{DispatchSignedRequest, HttpClient, Region};
     use rusoto_credential::AwsCredentials;
     use rusoto_signature::SignedRequest;
@@ -74,6 +75,7 @@ mod tests {
                             }
                         }
                         eprint!("\n");
+                        assert_eq!(r.status, StatusCode::OK);
                     }
                     Err(e) => panic!("Error from server: {:?}", e),
                 };
@@ -94,6 +96,7 @@ mod tests {
         let mut connector = HttpConnector::new_with_resolver(GaiResolver::new());
         connector.set_connect_timeout(Some(Duration::from_millis(10)));
         let client = HttpClient::<HttpConnector<GaiResolver>>::from_connector(connector);
+        let mut status = StatusCode::OK;
         match server
             .with_graceful_shutdown(async {
                 let region = Region::Custom {
@@ -125,6 +128,61 @@ mod tests {
                             }
                         }
                         eprint!("\n");
+                        status = r.status;
+                    }
+                    Err(e) => panic!("Error from server: {:?}", e),
+                };
+
+                ()
+            })
+            .await
+        {
+            Ok(()) => println!("Server shutdown normally"),
+            Err(e) => panic!("Server shutdown with error {:?}", e),
+        }
+
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test_env_log::test(tokio::test)]
+    async fn test_svc_wrapper_bad_creds() {
+        let make_svc = SpawnDummyHelloService {};
+        let server = Server::bind(&SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5939, 0, 0))).serve(make_svc);
+        let mut connector = HttpConnector::new_with_resolver(GaiResolver::new());
+        connector.set_connect_timeout(Some(Duration::from_millis(10)));
+        let client = HttpClient::<HttpConnector<GaiResolver>>::from_connector(connector);
+        match server
+            .with_graceful_shutdown(async {
+                let region = Region::Custom {
+                    name: "local".to_owned(),
+                    endpoint: "http://[::1]:5939".to_owned(),
+                };
+                let mut sr = SignedRequest::new("GET", "service", &region, "/");
+                sr.sign(&AwsCredentials::new(
+                    "AKIDEXAMPLE",
+                    "WRONGKEY",
+                    None,
+                    None,
+                ));
+                match client.dispatch(sr, Some(Duration::from_millis(100))).await {
+                    Ok(r) => {
+                        eprintln!("Response from server: {:?}", r.status);
+
+                        let mut body = r.body;
+                        loop {
+                            match body.next().await {
+                                Some(b_result) => match b_result {
+                                    Ok(bytes) => eprint!("{:?}", bytes),
+                                    Err(e) => {
+                                        eprintln!("Error while ready body: {:?}", e);
+                                        break;
+                                    }
+                                },
+                                None => break,
+                            }
+                        }
+                        eprint!("\n");
+                        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
                     }
                     Err(e) => panic!("Error from server: {:?}", e),
                 };
@@ -202,10 +260,13 @@ mod tests {
                         kind: SigningKeyKind::KSecret,
                         key: b"AWS4wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
                     };
+                    debug!("secret key: {:?} {:02x?}", k_secret, &k_secret.key);
 
                     let principal =
                         Principal::user("aws", "123456789012", "/", "test", "AIDAIAAAAAAAAAAAAAAAA").unwrap();
-                    Ok((principal, k_secret.derive(req.signing_key_kind, &req.request_date, req.region, req.service)))
+                    let derived = k_secret.derive(req.signing_key_kind, &req.request_date, req.region, req.service);
+                    debug!("derived key: {:?} {:02x?}", derived, &derived.key);
+                    Ok((principal, derived))    
                 } else {
                     Err(SignatureError::UnknownAccessKey {
                         access_key: req.access_key,
@@ -227,12 +288,20 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, _req: Request<Body>) -> Self::Future {
+        fn call(&mut self, req: Request<Body>) -> Self::Future {
             Box::pin(async move {
+                let (parts, _body) = req.into_parts();
+                let principal = parts.extensions.get::<Principal>();
+
+                let (status, body) = match principal {
+                    Some(principal) => (StatusCode::OK, format!("Hello {:?}", principal)),
+                    None => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
+                };
+
                 match Response::builder()
-                    .status(StatusCode::OK)
+                    .status(status)
                     .header("Content-Type", "text/plain")
-                    .body(Body::from("Hello world!"))
+                    .body(Body::from(body))
                 {
                     Ok(r) => Ok(r),
                     Err(e) => {
