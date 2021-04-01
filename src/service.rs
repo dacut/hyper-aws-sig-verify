@@ -1,113 +1,224 @@
-use std::{
-    any::type_name,
-    error::Error,
-    future::Future,
-    pin::Pin,
-    fmt::{Debug, Display, Formatter, Result as FmtResult},
-    task::{Context, Poll},
+use aws_sig_verify::{
+    sigv4_verify, GetSigningKeyRequest, Principal, Request as AwsSigVerifyRequest, SigningKey, SigningKeyKind,
 };
-use aws_sig_verify::{AWSSigV4Algorithm, Request as AwsSigVerifyRequest, Principal, SigningKeyKind, SignatureError, AWSSigV4};
 use chrono::Duration;
-use futures::{
-    stream::{StreamExt},
-};
+use futures::stream::StreamExt;
 use http::request::Parts;
 use hyper::{
     body::{Body, Bytes},
-    service::{Service},
     Error as HyperError, Request, Response, StatusCode,
 };
-use log::error;
+use log::{debug, error, warn};
 use serde_json::json;
+use std::{
+    any::type_name,
+    fmt::{Debug, Display, Formatter, Result as FmtResult},
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
+use tower::{buffer::Buffer, BoxError, Service, ServiceExt};
 
 /// AWSSigV4VerifierService implements a Hyper service that authenticates a request against AWS SigV4 signing protocol.
 #[derive(Clone)]
-pub struct AwsSigV4VerifierService<S> {
+pub struct AwsSigV4VerifierService<G, S>
+where
+    G: Service<GetSigningKeyRequest, Response = (Principal, SigningKey)> + Clone + Send + 'static,
+    G::Future: Send,
+    G::Error: Into<BoxError> + Send + Sync,
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
+    S::Future: Send,
+    S::Error: Into<BoxError> + Send + Sync,
+{
     pub signing_key_kind: SigningKeyKind,
-    // pub signing_key_fn: SKF,
     pub allowed_mismatch: Option<Duration>,
     pub region: String,
     pub service: String,
-    pub implementation: S,
+    pub get_signing_key: Buffer<G, GetSigningKeyRequest>,
+    pub implementation: Buffer<S, Request<Body>>,
 }
 
-impl<S> AwsSigV4VerifierService<S> {
-    pub fn new<S1, S2>(region: S1, service: S2, implementation: S) -> Self
+impl<G, S> AwsSigV4VerifierService<G, S>
+where
+    G: Service<GetSigningKeyRequest, Response = (Principal, SigningKey)> + Clone + Send + 'static,
+    G::Future: Send,
+    G::Error: Into<BoxError> + Send + Sync,
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
+    S::Future: Send,
+    S::Error: Into<BoxError> + Send + Sync,
+{
+    pub fn new<S1, S2>(region: S1, service: S2, get_signing_key: G, implementation: S) -> Self
     where
         S1: Into<String>,
         S2: Into<String>,
     {
         AwsSigV4VerifierService {
             signing_key_kind: SigningKeyKind::KSigning,
-            // signing_key_fn: signing_key_fn,
             allowed_mismatch: Some(Duration::minutes(5)),
             region: region.into(),
             service: service.into(),
-            implementation: implementation,
+            get_signing_key: Buffer::new(get_signing_key, 10),
+            implementation: Buffer::new(implementation, 10),
         }
     }
 }
 
-#[derive(Debug)]
-enum GetPrincipalError {
-    HyperError(HyperError),
-    SignatureError(SignatureError),
-}
-
-impl <S> AwsSigV4VerifierService<S> {
-}
-
-impl<S> Debug for AwsSigV4VerifierService<S> {
+impl<G, S> Debug for AwsSigV4VerifierService<G, S>
+where
+    G: Service<GetSigningKeyRequest, Response = (Principal, SigningKey)> + Clone + Send + 'static,
+    G::Future: Send,
+    G::Error: Into<BoxError> + Send + Sync,
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
+    S::Future: Send,
+    S::Error: Into<BoxError> + Send + Sync,
+{
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         f.debug_struct("AwsSigV4VerifierService")
             .field("region", &self.region)
             .field("service", &self.service)
+            .field("get_signing_key", &type_name::<G>())
             .field("implementation", &type_name::<S>())
             .finish()
     }
 }
 
-impl<S> Display for AwsSigV4VerifierService<S> {
+impl<G, S> Display for AwsSigV4VerifierService<G, S>
+where
+    G: Service<GetSigningKeyRequest, Response = (Principal, SigningKey)> + Clone + Send + 'static,
+    G::Future: Send,
+    G::Error: Into<BoxError> + Send + Sync,
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
+    S::Future: Send,
+    S::Error: Into<BoxError> + Send + Sync,
+{
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         Debug::fmt(self, f)
     }
 }
 
-impl<S> Service<Request<Body>> for AwsSigV4VerifierService<S>
-where
-    S: Service<Request<Body>, Response=Response<Body>,
-        Error=Box<dyn Error + Send + Sync + 'static>,
-        Future=Pin<Box<dyn Future<Output=Result<Response<Body>, Box<dyn Error + Send + Sync + 'static>>> + Send + Sync + 'static>>>
-    + Clone + Send + Sync + 'static,
-{
-    type Response = Response<Body>;
-    type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output=Result<Response<Body>, S::Error>> + Send + Sync + 'static>>;
+// impl<S, GSK> AwsSigV4VerifierService<S, GSK>
+// where
+//     S: Service<Request<Body>, Response=Response<Body>> + Send + Sync + 'static,
+//     S::Error: From<HyperError>,
+//     GSK: GetSigningKey + Clone + Send + Sync + 'static,
+//     GSK::Future: Send + Sync,
+// {
+//     async fn handle_call(&mut self, req: Request<Body>) -> Result<Response<Body>, <Self as Service<Request<Body>>>::Error> {
+//     }
+// }
 
-    fn poll_ready(&mut self, c: &mut Context) -> Poll<Result<(), S::Error>> {
-        self.implementation.poll_ready(c)
+impl<G, S> Service<Request<Body>> for AwsSigV4VerifierService<G, S>
+where
+    G: Service<GetSigningKeyRequest, Response = (Principal, SigningKey)> + Clone + Send + 'static,
+    G::Future: Send,
+    G::Error: Into<BoxError> + Send + Sync,
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
+    S::Future: Send,
+    S::Error: Into<BoxError> + Send + Sync,
+{
+    type Response = S::Response;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, c: &mut Context) -> Poll<Result<(), Self::Error>> {
+        match self.get_signing_key.poll_ready(c) {
+            Poll::Ready(r) => match r {
+                Ok(()) => match self.implementation.poll_ready(c) {
+                    Poll::Ready(r) => match r {
+                        Ok(()) => Poll::Ready(Ok(())),
+                        Err(e) => Poll::Ready(Err(e.into())),
+                    },
+                    Poll::Pending => Poll::Pending,
+                },
+                Err(e) => Poll::Ready(Err(e.into())),
+            },
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
+        let (parts, body) = req.into_parts();
+        let allowed_mismatch = self.allowed_mismatch.clone();
         let region = self.region.clone();
         let service = self.service.clone();
-        let mut implementation = self.implementation.clone();
-        Box::pin(async move {
-            let (mut parts, body) = req.into_parts();
-            match get_principal(region, service, &parts, body).await {
-                Ok((p, bytes)) => {
-                    parts.extensions.insert(p);
-                    let new_req = Request::from_parts(parts, Body::from(bytes));
-                    implementation.call(new_req).await
+        let signing_key_kind = self.signing_key_kind.clone();
+        let get_signing_key = self.get_signing_key.clone();
+        let implementation = self.implementation.clone();
+
+        Box::pin(handle_call(
+            parts,
+            body,
+            allowed_mismatch,
+            region,
+            service,
+            get_signing_key,
+            signing_key_kind,
+            implementation,
+        ))
+    }
+}
+
+async fn handle_call<G, S>(
+    mut parts: Parts,
+    body: Body,
+    allowed_mismatch: Option<Duration>,
+    region: String,
+    service: String,
+    get_signing_key: Buffer<G, GetSigningKeyRequest>,
+    signing_key_kind: SigningKeyKind,
+    implementation: Buffer<S, Request<Body>>,
+) -> Result<Response<Body>, BoxError>
+where
+    G: Service<GetSigningKeyRequest, Response = (Principal, SigningKey)> + Clone + Send + 'static,
+    G::Future: Send,
+    G::Error: Into<BoxError> + Send + Sync,
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
+    S::Future: Send,
+    S::Error: Into<BoxError> + Send + Sync,
+{
+    // We need the actual body in order to compute the signature.
+    match body_to_bytes(body).await {
+        Err(e) => Err(e.into()),
+        Ok(body) => {
+            let aws_req = AwsSigVerifyRequest::from_http_request_parts(&parts, Some(body.clone()));
+            let sig_req = match aws_req.to_get_signing_key_request(signing_key_kind, &region, &service) {
+                Ok(sig_req) => sig_req,
+                Err(e) => {
+                    error!("Failed to generate a GetSigningKeyRequest request from Request: {:?}", e);
+                    return Err(e.into());
+                }
+            };
+            let (principal, signing_key) = match get_signing_key.oneshot(sig_req).await {
+                Ok((principal, signing_key)) => {
+                    debug!("Get signing key returned principal {:?}", principal);
+                    (principal, signing_key)
+                }
+                Err(e) => {
+                    warn!("Get signing key failed: {:?}", e);
+                    return Err(e.into());
+                }
+            };
+            match sigv4_verify(&aws_req, &signing_key, allowed_mismatch, &region, &service) {
+                Ok(()) => {
+                    let new_body = Bytes::copy_from_slice(&body);
+                    parts.extensions.insert(principal);
+                    let new_req = Request::from_parts(parts, Body::from(new_body));
+                    match implementation.oneshot(new_req).await {
+                        Ok(r) => Ok(r),
+                        Err(e) => Err(e.into()),
+                    }
                 }
                 Err(e) => {
                     error!("Failed to verify signature: {:?}", e);
-                    let resp_body = Body::from(json!({
-                        "Error": {
-                            "Code": "NotAuthorized",
-                            "Message": "SigV4 validation failed",
-                        }
-                    }).to_string());
+                    let resp_body = Body::from(
+                        json!({
+                            "Error": {
+                                "Code": "NotAuthorized",
+                                "Message": "SigV4 validation failed",
+                            }
+                        })
+                        .to_string(),
+                    );
                     let response = Response::builder()
                         .status(StatusCode::UNAUTHORIZED)
                         .header("Content-Type", "application/json")
@@ -115,22 +226,6 @@ where
                     Ok(response.unwrap())
                 }
             }
-        })
-    }
-}
-
-async fn get_principal(_region: String, _service: String, parts: &Parts, body: Body) -> Result<(Principal, Bytes), GetPrincipalError> {
-    // We need the actual body in order to compute the signature.
-    match body_to_bytes(body).await {
-        Err(e) => Err(GetPrincipalError::HyperError(e)),
-        Ok(body) => {
-            Ok((Principal::service("local", "hello").unwrap(), Bytes::copy_from_slice(&body)))
-            // let aws_req = AwsSigVerifyRequest::from_http_request_parts(parts, Some(body.clone()), region, service);
-            // let sigv4 = AWSSigV4::new();
-            // match sigv4.verify(&aws_req, self.signing_key_kind, &self.signing_key_fn, self.allowed_mismatch).await {
-            //     Ok(p) => Ok((p, Bytes::copy_from_slice(&body))),
-            //     Err(e) => Err(GetPrincipalError::SignatureError(e)),
-            // }
         }
     }
 }
@@ -144,7 +239,7 @@ async fn body_to_bytes(mut body: Body) -> Result<Vec<u8>, HyperError> {
             Some(chunk_result) => match chunk_result {
                 Ok(chunk) => result.append(&mut chunk.to_vec()),
                 Err(e) => return Err(e),
-            }
+            },
         }
     }
 
