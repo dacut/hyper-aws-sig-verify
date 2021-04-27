@@ -1,8 +1,11 @@
 [package]
 name = "hyper_aws_sig_verify"
 description = "AWS SigV4 signature verification integration with Hyper"
+keywords = ["AWS", "Amazon", "Hyper"]
 version = "0.2.1"
 authors = ["David Cuthbert <dacut@kanga.org>"]
+homepage = "https://github.com/dacut/hyper-aws-sig-verify"
+repository = "https://github.com/dacut/hyper-aws-sig-verify"
 edition = "2018"
 license = "Apache-2.0"
 
