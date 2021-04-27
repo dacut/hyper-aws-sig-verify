@@ -4,9 +4,7 @@ pub use crate::service::AwsSigV4VerifierService;
 #[cfg(test)]
 mod tests {
     use crate::AwsSigV4VerifierService;
-    use aws_sig_verify::{
-        get_signing_key_fn, GetSigningKeyRequest, Principal, SignatureError, SigningKey, SigningKeyKind,
-    };
+    use aws_sig_verify::{get_signing_key_fn, GetSigningKeyRequest, SignatureError, SigningKey, SigningKeyKind};
     use chrono::{Date, Utc};
     use futures::stream::StreamExt;
     use http::StatusCode;
@@ -20,6 +18,7 @@ mod tests {
     use rusoto_core::{DispatchSignedRequest, HttpClient, Region};
     use rusoto_credential::AwsCredentials;
     use rusoto_signature::SignedRequest;
+    use scratchstack_aws_principal::PrincipalActor;
     use std::{
         convert::Infallible,
         future::Future,
@@ -158,12 +157,7 @@ mod tests {
                     endpoint: "http://[::1]:5939".to_owned(),
                 };
                 let mut sr = SignedRequest::new("GET", "service", &region, "/");
-                sr.sign(&AwsCredentials::new(
-                    "AKIDEXAMPLE",
-                    "WRONGKEY",
-                    None,
-                    None,
-                ));
+                sr.sign(&AwsCredentials::new("AKIDEXAMPLE", "WRONGKEY", None, None));
                 match client.dispatch(sr, Some(Duration::from_millis(100))).await {
                     Ok(r) => {
                         eprintln!("Response from server: {:?}", r.status);
@@ -203,14 +197,14 @@ mod tests {
         request_date: Date<Utc>,
         region: String,
         service: String,
-    ) -> Result<(Principal, SigningKey), SignatureError> {
+    ) -> Result<(PrincipalActor, SigningKey), SignatureError> {
         if access_key == "AKIDEXAMPLE" {
             let k_secret = SigningKey {
                 kind: SigningKeyKind::KSecret,
                 key: b"AWS4wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
             };
 
-            let principal = Principal::user("aws", "123456789012", "/", "test", "AIDAIAAAAAAAAAAAAAAAA").unwrap();
+            let principal = PrincipalActor::user("aws", "123456789012", "/", "test", "AIDAAAAAAAAAAAAAAAAA").unwrap();
             Ok((principal, k_secret.derive(signing_key_kind, &request_date, region, service)))
         } else {
             Err(SignatureError::UnknownAccessKey {
@@ -245,7 +239,7 @@ mod tests {
     #[derive(Clone)]
     struct GetDummyCreds {}
     impl Service<GetSigningKeyRequest> for GetDummyCreds {
-        type Response = (Principal, SigningKey);
+        type Response = (PrincipalActor, SigningKey);
         type Error = BoxError;
         type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -263,10 +257,10 @@ mod tests {
                     debug!("secret key: {:?} {:02x?}", k_secret, &k_secret.key);
 
                     let principal =
-                        Principal::user("aws", "123456789012", "/", "test", "AIDAIAAAAAAAAAAAAAAAA").unwrap();
+                        PrincipalActor::user("aws", "123456789012", "/", "test", "AIDAAAAAAAAAAAAAAAAA").unwrap();
                     let derived = k_secret.derive(req.signing_key_kind, &req.request_date, req.region, req.service);
                     debug!("derived key: {:?} {:02x?}", derived, &derived.key);
-                    Ok((principal, derived))    
+                    Ok((principal, derived))
                 } else {
                     Err(SignatureError::UnknownAccessKey {
                         access_key: req.access_key,
@@ -291,18 +285,14 @@ mod tests {
         fn call(&mut self, req: Request<Body>) -> Self::Future {
             Box::pin(async move {
                 let (parts, _body) = req.into_parts();
-                let principal = parts.extensions.get::<Principal>();
+                let principal = parts.extensions.get::<PrincipalActor>();
 
                 let (status, body) = match principal {
                     Some(principal) => (StatusCode::OK, format!("Hello {:?}", principal)),
                     None => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
                 };
 
-                match Response::builder()
-                    .status(status)
-                    .header("Content-Type", "text/plain")
-                    .body(Body::from(body))
-                {
+                match Response::builder().status(status).header("Content-Type", "text/plain").body(Body::from(body)) {
                     Ok(r) => Ok(r),
                     Err(e) => {
                         eprintln!("Response builder: error: {:?}", e);

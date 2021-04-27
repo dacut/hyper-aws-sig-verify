@@ -1,6 +1,4 @@
-use aws_sig_verify::{
-    sigv4_verify, GetSigningKeyRequest, Principal, Request as AwsSigVerifyRequest, SigningKey, SigningKeyKind,
-};
+use aws_sig_verify::{sigv4_verify, GetSigningKeyRequest, Request as AwsSigVerifyRequest, SigningKey, SigningKeyKind};
 use chrono::Duration;
 use futures::stream::StreamExt;
 use http::request::Parts;
@@ -9,6 +7,7 @@ use hyper::{
     Error as HyperError, Request, Response,
 };
 use log::{debug, warn};
+use scratchstack_aws_principal::PrincipalActor;
 use std::{
     any::type_name,
     fmt::{Debug, Display, Formatter, Result as FmtResult},
@@ -22,7 +21,7 @@ use tower::{buffer::Buffer, BoxError, Service, ServiceExt};
 #[derive(Clone)]
 pub struct AwsSigV4VerifierService<G, S>
 where
-    G: Service<GetSigningKeyRequest, Response = (Principal, SigningKey)> + Clone + Send + 'static,
+    G: Service<GetSigningKeyRequest, Response = (PrincipalActor, SigningKey)> + Clone + Send + 'static,
     G::Future: Send,
     G::Error: Into<BoxError> + Send + Sync,
     S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
@@ -39,7 +38,7 @@ where
 
 impl<G, S> AwsSigV4VerifierService<G, S>
 where
-    G: Service<GetSigningKeyRequest, Response = (Principal, SigningKey)> + Clone + Send + 'static,
+    G: Service<GetSigningKeyRequest, Response = (PrincipalActor, SigningKey)> + Clone + Send + 'static,
     G::Future: Send,
     G::Error: Into<BoxError> + Send + Sync,
     S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
@@ -64,7 +63,7 @@ where
 
 impl<G, S> Debug for AwsSigV4VerifierService<G, S>
 where
-    G: Service<GetSigningKeyRequest, Response = (Principal, SigningKey)> + Clone + Send + 'static,
+    G: Service<GetSigningKeyRequest, Response = (PrincipalActor, SigningKey)> + Clone + Send + 'static,
     G::Future: Send,
     G::Error: Into<BoxError> + Send + Sync,
     S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
@@ -83,7 +82,7 @@ where
 
 impl<G, S> Display for AwsSigV4VerifierService<G, S>
 where
-    G: Service<GetSigningKeyRequest, Response = (Principal, SigningKey)> + Clone + Send + 'static,
+    G: Service<GetSigningKeyRequest, Response = (PrincipalActor, SigningKey)> + Clone + Send + 'static,
     G::Future: Send,
     G::Error: Into<BoxError> + Send + Sync,
     S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
@@ -108,7 +107,7 @@ where
 
 impl<G, S> Service<Request<Body>> for AwsSigV4VerifierService<G, S>
 where
-    G: Service<GetSigningKeyRequest, Response = (Principal, SigningKey)> + Clone + Send + 'static,
+    G: Service<GetSigningKeyRequest, Response = (PrincipalActor, SigningKey)> + Clone + Send + 'static,
     G::Future: Send,
     G::Error: Into<BoxError> + Send + Sync,
     S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
@@ -168,7 +167,7 @@ async fn handle_call<G, S>(
     implementation: Buffer<S, Request<Body>>,
 ) -> Result<Response<Body>, BoxError>
 where
-    G: Service<GetSigningKeyRequest, Response = (Principal, SigningKey)> + Clone + Send + 'static,
+    G: Service<GetSigningKeyRequest, Response = (PrincipalActor, SigningKey)> + Clone + Send + 'static,
     G::Future: Send,
     G::Error: Into<BoxError> + Send + Sync,
     S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
@@ -213,7 +212,7 @@ where
                     Err(e) => warn!("Get signing key failed: {:?}", e),
                 }
             }
-            
+
             let new_body = Bytes::copy_from_slice(&body);
             let new_req = Request::from_parts(parts, Body::from(new_body));
             match implementation.oneshot(new_req).await {
